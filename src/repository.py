@@ -54,6 +54,16 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS event_versions (
+                    entity_id TEXT NOT NULL,
+                    version_no INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    published_by TEXT NOT NULL,
+                    communication_id TEXT,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(entity_id, version_no)
+                );
             """)
 
     @staticmethod
@@ -104,11 +114,14 @@ class SQLiteRepository:
         return [self._entity_from_row(row) for row in rows]
 
     def find_entities(self, kind, field, value):
-        return [
-            entity
-            for entity in self.list_entities(kind=kind)
-            if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
-        ]
+        def matches(entity):
+            if field == "id":
+                return entity["id"] == value
+            if field in ("status", "kind", "version"):
+                return entity.get(field) == value
+            return entity["data"].get(field) == value
+
+        return [entity for entity in self.list_entities(kind=kind) if matches(entity)]
 
     def update_entity(self, entity_id, expected_version, status, data):
         now = utcnow()
@@ -195,6 +208,54 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def save_version(self, entity, actor_id, communication_id=None):
+        version_no = int(entity["data"].get("revision_no") or entity["version"])
+        now = utcnow()
+        payload = json.dumps(entity["data"], ensure_ascii=False, sort_keys=True)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO event_versions"
+                "(entity_id, version_no, status, data, published_by, communication_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    entity["id"],
+                    version_no,
+                    entity["status"],
+                    payload,
+                    actor_id,
+                    communication_id,
+                    now,
+                ),
+            )
+        return {
+            "entity_id": entity["id"],
+            "version_no": version_no,
+            "status": entity["status"],
+            "data": entity["data"],
+            "published_by": actor_id,
+            "communication_id": communication_id,
+            "created_at": now,
+        }
+
+    def list_versions(self, entity_id):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM event_versions WHERE entity_id = ? ORDER BY version_no",
+                (entity_id,),
+            ).fetchall()
+        return [
+            {
+                "entity_id": row["entity_id"],
+                "version_no": int(row["version_no"]),
+                "status": row["status"],
+                "data": json.loads(row["data"]),
+                "published_by": row["published_by"],
+                "communication_id": row["communication_id"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def ping(self):
         with self._connect() as connection:

@@ -4,6 +4,26 @@ from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
 from .rules import RuleEngine
 
+# 这些动作一旦完成即对外生效，需要留存不可变的发布版本快照
+SNAPSHOT_ACTIONS = ("publish", "revise", "approve_revision")
+
+
+def data_diff(before, after):
+    """计算顶层字段变化，供审计记录“变化内容”。"""
+    changes = {}
+    for key in sorted(set(before) | set(after)):
+        old = before.get(key)
+        new = after.get(key)
+        if old == new:
+            continue
+        if key not in before:
+            changes[key] = {"op": "added", "to": new}
+        elif key not in after:
+            changes[key] = {"op": "removed", "from": old}
+        else:
+            changes[key] = {"op": "changed", "from": old, "to": new}
+    return changes
+
 
 class DomainService:
     def __init__(self, repository, rules=None):
@@ -37,6 +57,16 @@ class DomainService:
             self.repository.save_idempotency(actor.user_id, idempotency_key, entity_id)
         return entity
 
+    @staticmethod
+    def _apply_patch(before, patch):
+        merged = dict(before)
+        for key, value in patch.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+        return merged
+
     def transition(self, actor, entity_id, action, data=None, expected_version=None):
         entity = self.repository.get_entity(entity_id)
         if not entity:
@@ -45,16 +75,21 @@ class DomainService:
         next_status, patch = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
         )
-        merged = dict(entity["data"])
-        merged.update(patch)
+        before_data = dict(entity["data"])
+        merged = self._apply_patch(before_data, patch)
         updated = self.repository.update_entity(entity_id, expected, next_status, merged)
+        detail = {"patch": patch, "changes": data_diff(before_data, merged)}
+        if action in SNAPSHOT_ACTIONS:
+            communication_id = merged.get("communication_id")
+            version = self.repository.save_version(updated, actor.user_id, communication_id)
+            detail["published_version_no"] = version["version_no"]
         self.audit.record(
             entity_id,
             actor,
             action,
             entity["status"],
             updated["status"],
-            {"patch": patch},
+            detail,
         )
         return updated
 
@@ -68,6 +103,11 @@ class DomainService:
         if kind:
             kind = self.rules.normalize_kind(kind)
         return self.repository.list_entities(kind=kind, status=status)
+
+    def versions(self, entity_id):
+        if not self.repository.get_entity(entity_id):
+            raise NotFoundError("entity not found: " + entity_id)
+        return self.repository.list_versions(entity_id)
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)

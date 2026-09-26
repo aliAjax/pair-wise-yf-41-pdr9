@@ -22,7 +22,13 @@
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+GET  /api/entities/&lt;id&gt;/versions   （历次对外发布版本）
+POST /api/entities/&lt;id&gt;/actions
+
+台站检修缺报补录复核：
+  值班员 backfill           → revision_pending（原发布震级不变）
+  复核员 approve_revision   → confirmed:true 后修订才对外生效
+  复核员 reject_revision    → 驳回，原发布内容不变</pre>
 </main>
 <script>
 async function checkHealth() {
