@@ -26,6 +26,13 @@ python3 app.py --db ./data.db --port 8307
 
 - `station`：观测台站；`event`：地震事件及其多个修订版本。
 
+## 补录复核流程
+
+- 台站`offline`后，其报告不再参与新事件关联：`associate`时自动剔除并记入`excluded_offline`，在线报告不足两份则关联失败。
+- 台站恢复`online`后，值班员（analyst）对已发布事件执行`backfill`，提交`reason`、`magnitude`、`backfill_reports`，事件进入`revision_pending`，修订内容写入`pending_revision`（含新旧震级、参评台站数、提交人和时间）。此时原发布的震级、报告和参评台站数保持不变，仍可查询。
+- 复核员（reviewer）对比`pending_revision`中的新旧值后执行`confirm_revision`，修订才对外生效：状态变为`revised`，`effective_revision`递增，`last_revision`记录本次变化；若执行`reject_revision`，事件退回补录前状态，待审修订作废。
+- 补录报告中的台站必须已恢复上线，且不能重复事件已有台站。每一步的处理人、时间和变化内容都写入审计日志（`GET /api/audit`）。
+
 ## 主要接口
 
 - `GET /health`：健康检查。

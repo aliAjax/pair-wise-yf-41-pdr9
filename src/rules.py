@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
@@ -23,9 +23,93 @@ def _validate_event(actor, data, lookup):
 
 def _validate_associate(actor, entity, data, lookup):
     reports = entity["data"].get("reports") or []
-    if len(reports) < 2:
-        raise ValidationError("two reports are required for association")
-    return {"associated_count": len(reports)}
+    online, excluded = _partition_by_station_status(reports, lookup)
+    if len(online) < 2:
+        raise ValidationError("association requires at least two reports from online stations")
+    return {
+        "associated_count": len(online),
+        "station_count": _station_count(online),
+        "excluded_offline": excluded,
+    }
+
+
+def _validate_backfill(actor, entity, data, lookup):
+    reason = data.pop("reason")
+    magnitude = data.pop("magnitude")
+    backfill = data.pop("backfill_reports")
+    current = entity["data"].get("reports") or []
+    known = {report.get("station") for report in current}
+    for report in backfill:
+        code = report.get("station")
+        if not code:
+            raise ValidationError("backfill report requires a station code")
+        if code in known:
+            raise ValidationError("station %s already reported for this event" % code)
+        station = _find_station(lookup, code)
+        if station is not None and station.get("status") == "offline":
+            raise ValidationError("station %s has not recovered yet" % code)
+        known.add(code)
+    merged = list(current) + list(backfill)
+    return {
+        "pending_revision": {
+            "reason": reason,
+            "magnitude": magnitude,
+            "backfill_reports": backfill,
+            "reports": merged,
+            "station_count": _station_count(merged),
+            "base_status": entity["status"],
+            "base_magnitude": entity["data"].get("magnitude"),
+            "base_station_count": entity["data"].get("station_count") or _station_count(current),
+            "submitted_by": actor.user_id,
+            "submitted_at": _now(),
+        }
+    }
+
+
+def _validate_confirm_revision(actor, entity, data, lookup):
+    pending = entity["data"].get("pending_revision")
+    if not pending:
+        raise ValidationError("no pending revision to confirm")
+    reviewer = data.pop("reviewer")
+    revision = (entity["data"].get("effective_revision") or 1) + 1
+    return {
+        "reports": list(pending.get("reports") or []),
+        "magnitude": pending.get("magnitude"),
+        "station_count": pending.get("station_count"),
+        "effective_revision": revision,
+        "pending_revision": None,
+        "last_revision": {
+            "revision": revision,
+            "reason": pending.get("reason"),
+            "previous_magnitude": pending.get("base_magnitude"),
+            "magnitude": pending.get("magnitude"),
+            "previous_station_count": pending.get("base_station_count"),
+            "station_count": pending.get("station_count"),
+            "backfilled_stations": [
+                report.get("station") for report in pending.get("backfill_reports") or []
+            ],
+            "submitted_by": pending.get("submitted_by"),
+            "submitted_at": pending.get("submitted_at"),
+            "reviewer": reviewer,
+        },
+    }
+
+
+def _validate_reject_revision(actor, entity, data, lookup):
+    pending = entity["data"].get("pending_revision")
+    if not pending:
+        raise ValidationError("no pending revision to reject")
+    return {
+        "__status__": pending.get("base_status") or "published",
+        "pending_revision": None,
+        "last_rejection": {
+            "reason": data.pop("reason"),
+            "rejected_magnitude": pending.get("magnitude"),
+            "rejected_station_count": pending.get("station_count"),
+            "submitted_by": pending.get("submitted_by"),
+            "rejected_by": actor.user_id,
+        },
+    }
 
 
 def associate_reports(reports, max_delta=120, max_distance=3.0):
@@ -50,17 +134,17 @@ def magnitude_median(amplitudes):
 
 
 CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event}
-CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
+CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate, ('event', 'backfill'): _validate_backfill, ('event', 'confirm_revision'): _validate_confirm_revision, ('event', 'reject_revision'): _validate_reject_revision}
 
 
 class RuleEngine:
     ALIASES = {'stations': 'station', 'events': 'event'}
     INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
-    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
+    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'backfill': (('published', 'revised'), 'revision_pending'), 'confirm_revision': (('revision_pending',), 'revised'), 'reject_revision': (('revision_pending',), 'published'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
     CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
-    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
+    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'backfill'): ('reason', 'magnitude', 'backfill_reports'), ('event', 'confirm_revision'): ('reviewer',), ('event', 'reject_revision'): ('reason',), ('event', 'withdraw'): ('reason',)}
     CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
+    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'backfill': ('admin', 'analyst'), 'confirm_revision': ('admin', 'reviewer'), 'reject_revision': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -111,10 +195,16 @@ class RuleEngine:
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
+        if extra:
+            next_status = extra.pop("__status__", next_status)
         patch = dict(data)
         if extra:
             patch.update(extra)
         return next_status, patch
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _find_one(lookup, kind, field, value):
@@ -122,6 +212,27 @@ def _find_one(lookup, kind, field, value):
         return None
     rows = lookup(kind, field, value) or []
     return rows[0] if rows else None
+
+
+def _find_station(lookup, code):
+    if lookup is None or not code:
+        return None
+    return _find_one(lookup, "station", "code", code)
+
+
+def _partition_by_station_status(reports, lookup):
+    online, excluded = [], []
+    for report in reports:
+        station = _find_station(lookup, report.get("station"))
+        if station is not None and station.get("status") == "offline":
+            excluded.append(report.get("station"))
+        else:
+            online.append(report)
+    return online, excluded
+
+
+def _station_count(reports):
+    return len({report.get("station") for report in reports})
 
 
 def _date_ordinal(value):
